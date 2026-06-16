@@ -1,0 +1,19 @@
+{
+  "name": "pmtiles-core",
+  "version": "1.0.0",
+  "description": "PMTiles v3 read/write system with MongoDB support",
+  "main": "lib/pmtile.js",
+  "scripts": {
+    "test": "node test/pmtile.test.js",
+    "export": "node scripts/exportFromMongo.js"
+  },
+  "dependencies": {
+    "pmtiles": "^4.4.1",
+    "log4js": "^6.9.1",
+    "mongodb": "^6.3.0"
+  },
+  "devDependencies": {},
+  "keywords": ["pmtiles", "tiles", "map", "mongodb"],
+  "author": "",
+  "license": "MIT"
+}
