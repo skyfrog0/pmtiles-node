@@ -5,7 +5,8 @@
   "main": "lib/pmtile.js",
   "scripts": {
     "test": "node test/pmtile.test.js",
-    "export": "node scripts/exportFromMongo.js"
+    "export": "node scripts/exportFromMongo.js",
+    "export-url": "node scripts/exportFromUrl.js"
   },
   "dependencies": {
     "pmtiles": "^4.4.1",

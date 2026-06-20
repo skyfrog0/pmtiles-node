@@ -1,6 +1,6 @@
 # PMTiles Core
 
-基于 Node.js 的 PMTiles v3 读写系统，支持从 MongoDB 导出瓦片数据为 PMTiles 单文件格式。
+基于 Node.js 的 PMTiles v3 读写系统，支持从 MongoDB 导出瓦片数据、或从瓦片服务 URL 并发抓取栅格瓦片（PNG/JPG）导出为 PMTiles 单文件格式。
 
 ## 特性
 
@@ -8,6 +8,7 @@
 - 自动切分 Leaf Dictionaries，优化大文件随机访问性能
 - 支持 Hilbert 曲线 TileID 编码
 - 支持从 MongoDB 批量导出瓦片数据
+- 支持从瓦片服务 URL 并发抓取栅格瓦片（PNG/JPG）导出，含实时进度条
 - 使用 log4js 进行日志记录
 - 支持大数据量处理（临时文件存储）
 
@@ -29,7 +30,8 @@ pmtiles-core/
 │   ├── tileId.js           # TileID 编码模块
 │   └── utils.js            # 工具函数
 ├── scripts/
-│   └── exportFromMongo.js  # MongoDB 导出脚本
+│   ├── exportFromMongo.js  # MongoDB 导出脚本
+│   └── exportFromUrl.js    # 瓦片服务 URL 栅格瓦片导出脚本（并发抓取 PNG/JPG，含进度条）
 ├── config/
 │   └── log4js.config.json  # log4js 配置
 └── test/
@@ -111,9 +113,22 @@ node scripts/exportFromMongo.js --output tiles.pmtiles --dataset my_dataset --mo
 | `--db <name>` | 数据库名称 | tiles |
 | `--collection <name>` | 集合名称 | tiles |
 | `--dataset <name>` | 数据集名称过滤 | 全部 |
+| `--min-zoom <num>` | 最小缩放层级（含，0-26） | 不限制 |
+| `--max-zoom <num>` | 最大缩放层级（含，0-26） | 不限制 |
 | `--batch-size <num>` | 批量处理大小 | 1000 |
+| `--concurrency <num>` | 瓦片拉取并发数 | 20 |
+| `--temp-dir <path>` | 临时文件目录 | 与 output 同目录 |
 | `--tile-type <type>` | 瓦片类型: mvt, png, jpg, webp | mvt |
 | `--compression <type>` | 压缩类型: gzip, none | gzip |
+
+#### 导出流程
+
+1. **阶段一**：`countDocuments` 统计总数，游标分页拉取仅含 `{zoom, x, y}` 的字段集合
+2. **排序**：在内存中按 Hilbert TileID 升序排序
+3. **阶段二**：按 tileId 顺序逐个 xyz 并发拉取所有分片，按 `_id` 升序拼接为完整瓦片；MD5 指纹去重，相同内容只写入临时文件一次
+4. **阶段三**：调用 `PMTile.writeStreaming` 流式组装最终 PMTiles 文件（瓦片数据从临时文件流式复制，不进入内存）
+
+> 由于 MongoDB 单文档 16MB 限制，相同 xyz 编号的瓦片可能被拆分为多张分片文档存储，导出时会自动按 `_id` 升序拼接合并。
 
 #### MongoDB 数据结构要求
 
@@ -128,12 +143,63 @@ node scripts/exportFromMongo.js --output tiles.pmtiles --dataset my_dataset --mo
 }
 ```
 
+建议在 `zoom`、`x`、`y`（以及 `dataset`）字段上建立复合索引，以加速范围查询与逐 xyz 拉取：
+
+```javascript
+db.tiles.createIndex({ dataset: 1, zoom: 1, x: 1, y: 1 })
+```
+
 可选字段：
 ```javascript
 {
   dataset: String    // 数据集名称（用于筛选）
 }
 ```
+
+### 从瓦片服务 URL 导出栅格瓦片
+
+从 HTTP 瓦片服务并发抓取 PNG/JPG 栅格瓦片，按 Hilbert TileID 有序导出为 PMTiles 文件。适用于将在线瓦片服务离线归档。
+
+```bash
+npm run export-url -- \
+  --url "http://172.16.67.167:8091/mapserver/vmap/bj68w/getMap?styleId=bj68w&x={x}&y={y}&l={z}" \
+  --output tiles.pmtiles --min-zoom 8 --max-zoom 14 \
+  --bbox 115.8,39.4,117.4,41.1 --srid 4326 --tile-type png --concurrency 20
+```
+
+> URL 也支持不带占位符的原始形态：自动替换 `x=`/`y=`/`l=`/`z=` 查询参数的值，其余参数（如 `styleId`）保持不变。
+
+#### 命令行参数
+
+| 参数 | 描述 | 默认值 |
+|------|------|--------|
+| `--url <url>` | 瓦片源 URL 模板（支持 `{x}`/`{y}`/`{z}`/`{l}` 占位符，或自动替换 `x=`/`y=`/`l=`/`z=` 查询参数） | 必需 |
+| `--output <path>` | 输出 .pmtiles 文件路径 | 必需 |
+| `--min-zoom <num>` | 最小缩放层级（含，0-26） | 必需 |
+| `--max-zoom <num>` | 最大缩放层级（含，0-26） | 必需 |
+| `--bbox <minLon,minLat,maxLon,maxLat>` | 导出范围（4326 为度；3857 为米 `minX,minY,maxX,maxY`） | 必需 |
+| `--srid <num>` | 坐标系：4326 / 3857 | 4326 |
+| `--tile-type <type>` | 瓦片类型：png / jpg / jpeg | png |
+| `--compression <type>` | 瓦片压缩：none / gzip（栅格已压缩，默认 none） | none |
+| `--concurrency <num>` | 并发请求数（=批大小） | 20 |
+| `--retry <num>` | 瞬时错误（5xx/网络/超时）重试次数 | 3 |
+| `--timeout <ms>` | 单请求超时（毫秒） | 30000 |
+| `--temp-dir <path>` | 临时文件目录 | 与 output 同目录 |
+| `--name <text>` | 元数据 name | Raster Tiles |
+| `--description <text>` | 元数据 description | 自动生成 |
+
+#### 导出流程
+
+1. **bbox → 瓦片集合**：按 `--srid`（3857 先转经纬度）逐层计算瓦片范围，纬度钳制 ±85.05112878，瓦片坐标钳制 `[0,2^z-1]`，按 Hilbert TileID 升序排序。
+2. **分批并发抓取**：以 `--concurrency` 为批大小，每批 `Promise.all` 并发请求；404/空响应静默跳过，5xx/网络/超时按 `--retry` 指数退避重试后仍失败则跳过并告警。
+3. **有序写入临时文件**：批内按 tileId 顺序顺序写入临时瓦片数据文件，记录 `{tileId, offset, length, runLength:1}`；不做 MD5 去重以保证 offset 单调（`clustered=true` 真实成立）。
+4. **流式落盘**：调用 `PMTile.writeStreaming` 组装 Header/Root/Metadata/Leaves 并流式追加临时瓦片数据，临时文件 + `rename` 原子落盘。
+
+#### 进度显示
+
+- **TTY 环境**：用 `\r` 原地刷新进度条，显示 `[bar] 66.7% 1800/2700 18.2t/s skip:5 2.1MB ETA:1m12s`（100ms 节流）。
+- **非 TTY（重定向/CI）**：回退到 log4js 每 5000 个瓦片的周期日志。
+- 设环境变量 `PMTILES_FORCE_TTY=1` 可强制启用进度条。
 
 ## API 文档
 
