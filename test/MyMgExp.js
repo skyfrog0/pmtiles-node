@@ -11,6 +11,8 @@ async function main() {
         concurrency: 10,
         tileType: 'gvt',
         tileCompression:  COMPRESSION.NO_COMPRESSION,
+        minZoom: 2,
+        maxZoom: 9
     };
 
 
