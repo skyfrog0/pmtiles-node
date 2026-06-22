@@ -1,6 +1,6 @@
 const { ZxyToID, IDToZxy } = require('../lib/tileId');
 
-const [z,x,y] = [4, 12, 6];
+const [z,x,y] = [1, 0, 0];
 const tileId = ZxyToID(z, x, y);
 const decoded = IDToZxy(tileId);
 
