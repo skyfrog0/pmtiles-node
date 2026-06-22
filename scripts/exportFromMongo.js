@@ -1,3 +1,5 @@
+'use strict';
+
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -5,91 +7,14 @@ const log4js = require('log4js');
 const { MongoClient } = require('mongodb');
 const { PMTile, TILE_TYPE, COMPRESSION } = require('../lib/pmtile');
 const { ZxyToID } = require('../lib/tileId');
+const { AsyncPool } = require('../lib/asyncPool');
+const { OrderedWriter } = require('../lib/orderedWriter');
+const { MongoScanner } = require('../lib/mongoScanner');
 
 log4js.configure(path.join(__dirname, '../config/log4js.config.json'));
 const logger = log4js.getLogger('pmtiles');
 
 const MAX_ZOOM = 20;
-
-/**
- * 构造查询条件：dataset / zoom 范围过滤。
- * 三个阶段（count / xyz 扫描 / 瓦片拉取）共用同一基础 query。
- */
-function buildQuery({ datasetName, minZoom, maxZoom }) {
-  const query = {};
-  if (datasetName) {
-    query.dataset = datasetName;
-  }
-  if (minZoom !== undefined || maxZoom !== undefined) {
-    const zoomCond = {};
-    if (minZoom !== undefined) zoomCond.$gte = minZoom;
-    if (maxZoom !== undefined) zoomCond.$lte = maxZoom;
-    query.zoom = zoomCond;
-  }
-  return query;
-}
-
-/**
- * 校验 minZoom / maxZoom 参数合法性。
- */
-function validateZoomRange(minZoom, maxZoom) {
-  if (minZoom !== undefined && (minZoom < 0 || minZoom > MAX_ZOOM)) {
-    throw new Error(`--min-zoom must be in [0, ${MAX_ZOOM}], got ${minZoom}`);
-  }
-  if (maxZoom !== undefined && (maxZoom < 0 || maxZoom > MAX_ZOOM)) {
-    throw new Error(`--max-zoom must be in [0, ${MAX_ZOOM}], got ${maxZoom}`);
-  }
-  if (minZoom !== undefined && maxZoom !== undefined && minZoom > maxZoom) {
-    throw new Error(`--min-zoom (${minZoom}) must be <= --max-zoom (${maxZoom})`);
-  }
-}
-
-/**
- * 简易并发池：限制 worker 并发数为 size，按 items 顺序返回结果。
- */
-async function asyncPool(items, size, worker) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-  let completed = 0;
-
-  async function runOne() {
-    while (true) {
-      const idx = nextIndex++;
-      if (idx >= items.length) return;
-      results[idx] = await worker(items[idx], idx);
-      completed++;
-    }
-  }
-
-  const workers = [];
-  for (let i = 0; i < Math.min(size, items.length); i++) {
-    workers.push(runOne());
-  }
-  await Promise.all(workers);
-  return results;
-}
-
-/**
- * 拉取单个 xyz 对应的所有分片，按 _id 升序拼接为完整瓦片 Buffer。
- */
-async function fetchAndMergeTile(collection, baseQuery, z, x, y) {
-  const tileQuery = { ...baseQuery, zoom: z, x, y };
-  // 删除 zoom 范围条件（已被精确值覆盖）
-  if (tileQuery.zoom && typeof tileQuery.zoom === 'object') {
-    delete tileQuery.zoom;
-    tileQuery.zoom = z;
-  }
-  const docs = await collection.find(tileQuery).sort({ _id: 1 }).toArray();
-  if (docs.length === 0) return null;
-
-  const buffers = docs.map((doc) => {
-    if (!doc.tile_data) return null;
-    return doc.tile_data.buffer ? doc.tile_data : Buffer.from(doc.tile_data);
-  }).filter((b) => b !== null);
-
-  if (buffers.length === 0) return null;
-  return Buffer.concat(buffers);
-}
 
 async function exportFromMongo(options) {
   const {
@@ -107,7 +32,7 @@ async function exportFromMongo(options) {
     tempDir
   } = options;
 
-  validateZoomRange(minZoom, maxZoom);
+  MongoScanner.validateZoomRange(minZoom, maxZoom);
 
   logger.info(`Starting export from MongoDB: ${mongoUri}/${dbName}.${collectionName}`);
   logger.info(`Dataset: ${datasetName || '(all)'}`);
@@ -115,7 +40,7 @@ async function exportFromMongo(options) {
   logger.info(`Output: ${outputPath}`);
   logger.info(`Concurrency: ${concurrency}`);
 
-  const baseQuery = buildQuery({ datasetName, minZoom, maxZoom });
+  const baseQuery = MongoScanner.buildQuery({ datasetName, minZoom, maxZoom });
 
   let client;
   let tempTileHandle;
@@ -126,7 +51,7 @@ async function exportFromMongo(options) {
     const db = client.db(dbName);
     const collection = db.collection(collectionName);
 
-    // ===== 阶段一：统计 + 拉取 xyz 编号 =====
+    // ===== Stage 1: count + scan xyz =====
     const count = await collection.countDocuments(baseQuery);
     logger.info(`Found ${count} tile documents matching query`);
     if (count === 0) {
@@ -135,23 +60,7 @@ async function exportFromMongo(options) {
     }
 
     logger.info('Stage 1: scanning tile xyz coordinates...');
-    const xyzList = [];
-    const cursor = collection
-      .find(baseQuery, { projection: { _id: 0, zoom: 1, x: 1, y: 1 } })
-      .batchSize(batchSize)
-      .noCursorTimeout();
-
-    try {
-      await cursor.forEach((doc) => {
-        if (doc.zoom === undefined || doc.x === undefined || doc.y === undefined) {
-          logger.warn(`Skipping doc with missing xyz: ${JSON.stringify(doc)}`);
-          return;
-        }
-        xyzList.push({ z: doc.zoom, x: doc.x, y: doc.y });
-      });
-    } finally {
-      await cursor.close();
-    }
+    const xyzList = await MongoScanner.scanXyz(collection, baseQuery, batchSize);
     logger.info(`Stage 1 done: collected ${xyzList.length} xyz entries`);
 
     if (xyzList.length === 0) {
@@ -159,81 +68,77 @@ async function exportFromMongo(options) {
       return;
     }
 
-    // ===== 排序：按 tileId 升序 =====
+    // Sort by Hilbert TileID + dedup
     logger.info('Sorting by Hilbert TileID...');
     const sorted = xyzList
       .map((v) => ({ ...v, tileId: BigInt(ZxyToID(v.z, v.x, v.y)) }))
       .sort((a, b) => (a.tileId < b.tileId ? -1 : a.tileId > b.tileId ? 1 : 0));
 
-    // 去重 xyz（相同 xyz 在阶段二会被合并为一份瓦片，故条目只保留一份）
     const dedupSorted = [];
     for (const item of sorted) {
       const last = dedupSorted[dedupSorted.length - 1];
-      if (last && last.z === item.z && last.x === item.x && last.y === item.y) {
-        continue;
-      }
+      if (last && last.z === item.z && last.x === item.x && last.y === item.y) continue;
       dedupSorted.push(item);
     }
     logger.info(`Unique xyz count: ${dedupSorted.length}`);
 
-    // ===== 阶段二：按 tileId 顺序拉取瓦片分片，拼接 + MD5 去重，写入临时瓦片文件 =====
+    // ===== Stage 2: fetch + merge + dedup + ordered write =====
     logger.info('Stage 2: fetching and merging tile shards...');
     const resolvedTempDir = tempDir || path.dirname(outputPath);
     tempTilePath = path.join(resolvedTempDir, `pmtiles_tiledata_${Date.now()}.tmp`);
     tempTileHandle = await fs.promises.open(tempTilePath, 'w');
 
     const md5Index = new Map(); // md5hex -> { offset, length }
-    const entries = [];
-    let tempTileSize = 0;
-    let processed = 0;
+    const writer = new OrderedWriter(tempTileHandle);
+    let fetchProgress = 0;
 
-    await asyncPool(dedupSorted, concurrency, async (item) => {
-      const merged = await fetchAndMergeTile(collection, baseQuery, item.z, item.x, item.y);
+    const poolResults = await AsyncPool.run(dedupSorted, concurrency, async (item, idx) => {
+      const merged = await MongoScanner.fetchTile(collection, baseQuery, item.z, item.x, item.y);
       if (!merged) {
         logger.warn(`No tile_data for z=${item.z} x=${item.x} y=${item.y}, skipping`);
-        return;
+        await writer.write(idx, null);
+        return null;
+      }
+
+      fetchProgress++;
+      if (fetchProgress % 5000 === 0) {
+        logger.info(`Stage 2 progress: ${fetchProgress}/${dedupSorted.length} tiles, unique=${md5Index.size}`);
       }
 
       const md5 = crypto.createHash('md5').update(merged).digest('hex');
-
-      let offset;
-      let length;
       const cached = md5Index.get(md5);
       if (cached) {
-        offset = cached.offset;
-        length = cached.length;
-      } else {
-        offset = BigInt(tempTileSize);
-        length = BigInt(merged.length);
-        // 串行写文件（worker 间共享 fileHandle）
-        await tempTileHandle.write(merged);
-        tempTileSize += merged.length;
-        md5Index.set(md5, { offset, length });
+        await writer.write(idx, null);
+        return {
+          tileId: item.tileId,
+          offset: cached.offset,
+          length: cached.length,
+          runLength: BigInt(1)
+        };
       }
 
-      entries.push({
-        tileId: item.tileId,
-        offset,
-        length,
-        runLength: BigInt(1)
-      });
+      const offset = await writer.write(idx, merged);
+      const length = BigInt(merged.length);
+      md5Index.set(md5, { offset, length });
 
-      processed++;
-      if (processed % 5000 === 0) {
-        logger.info(`Stage 2 progress: ${processed}/${dedupSorted.length} tiles, unique=${md5Index.size}`);
-      }
+      return { tileId: item.tileId, offset, length, runLength: BigInt(1) };
     });
+
+    const entries = [];
+    for (const r of poolResults) {
+      if (r) entries.push(r);
+    }
 
     await tempTileHandle.close();
     tempTileHandle = null;
-    logger.info(`Stage 2 done: ${entries.length} entries, ${md5Index.size} unique tile contents, temp file size=${tempTileSize}`);
+    logger.info(`Stage 2 done: ${entries.length} entries, ${md5Index.size} unique tile contents, temp file size=${writer.bytesWritten}`);
 
     if (entries.length === 0) {
       logger.warn('No tile data fetched; aborting');
       return;
     }
 
-    // ===== 阶段三：调用 writeStreaming 流式落盘 =====
+    // ===== Stage 3: write PMTiles =====
     logger.info('Stage 3: writing PMTiles file...');
     const pmtile = new PMTile();
     pmtile.setTileType(tileType);
@@ -336,10 +241,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {
-  exportFromMongo,
-  buildQuery,
-  validateZoomRange,
-  asyncPool,
-  fetchAndMergeTile
-};
+module.exports = { exportFromMongo };
