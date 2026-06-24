@@ -11,9 +11,6 @@ npm install
 # 运行测试（pmtile 主测试）
 npm test
 
-# 运行 MVT 测试
-node test/mvt.test.js
-
 # Header 调试脚本
 node test/debug_header.js
 
@@ -40,8 +37,6 @@ lib/
 ├── leafDictionary.js   # 自动 Leaf Dictionary 切分；目标根目录大小 16384-127=16257 字节
 ├── tileId.js           # Hilbert 曲线 TileID 编码：ZxyToID / IDToZxy
 ├── utils.js            # 字节序读写（小端序）、varint 编解码、字符串读写
-└── mvt.js              # Mapbox Vector Tile (MVT) 编解码：MVTLayer、MVTTile 类
-
 scripts/exportFromMongo.js  # MongoDB → PMTiles 导出脚本（支持命令行参数）
 scripts/exportFromUrl.js    # 瓦片服务 URL → 栅格 PMTiles 导出脚本（并发抓取 PNG/JPG，含进度条）
 config/log4js.config.json   # log4js 配置（控制台 + 文件输出，日志在 logs/pmtiles.log）
@@ -105,6 +100,7 @@ test/                       # 测试与调试脚本
 - `pmtiles@^4.4.1`（参考规范与部分结构）
 - `log4js@^6.9.1`（日志）
 - `mongodb@^6.3.0`（MongoDB 驱动）
+- `@mapbox/vector-tile@^2.0.2` + `@mapbox/pbf@^4.0.0`（MVT 编解码，替代旧 `lib/mvt.js`）
 
 ## 注意事项
 - 处理大文件偏移/超大 TileID 时，优先保持 BigInt 链路完整，避免中途转 Number。

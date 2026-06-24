@@ -11,7 +11,9 @@
   "dependencies": {
     "pmtiles": "^4.4.1",
     "log4js": "^6.9.1",
-    "mongodb": "^6.3.0"
+    "mongodb": "^6.3.0",
+    "@mapbox/vector-tile": "^2.0.2",
+    "@mapbox/pbf": "^4.0.0"
   },
   "devDependencies": {},
   "keywords": ["pmtiles", "tiles", "map", "mongodb"],
